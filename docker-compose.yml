@@ -1,0 +1,16 @@
+services:
+  symmetry:
+    build: .
+    image: cn4m-symmetry
+    container_name: cn4m-symmetry
+    restart: unless-stopped
+    env_file: .env
+    # Hard links cannot cross mount points, so mount ONE parent directory and
+    # point SOURCE_DIR/TARGET_DIR at subfolders inside it. Two separate bind
+    # mounts will fail with EXDEV even on the same disk.
+    # On Windows, HOST_DATA_DIR=M:/ mounts that drive at /data, so a source of
+    # M:\test becomes SOURCE_DIR=/data/test inside the container.
+    volumes:
+      - ${HOST_DATA_DIR:-/mnt/pool}:/data
+    # Uncomment to run as your own user instead of root:
+    # user: "1000:1000"
