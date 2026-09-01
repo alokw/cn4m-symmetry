@@ -16,6 +16,8 @@ import sys
 import time
 from pathlib import Path
 
+import webui
+
 try:
     from dotenv import load_dotenv
 except ImportError:  # dotenv is optional; plain env vars work fine
@@ -62,6 +64,9 @@ class Config:
         self.exclude = env_list("EXCLUDE_PATTERNS")
         self.quarantine_file = os.getenv("QUARANTINE_FILE", "assets.json").strip()
         self.stable_seconds = max(0, env_int("STABLE_SECONDS", 60))
+        self.web_enabled = env_bool("WEB_ENABLED", True)
+        self.web_host = os.getenv("WEB_HOST", "0.0.0.0").strip()
+        self.web_port = env_int("WEB_PORT", 2648)
         self.run_once = env_bool("RUN_ONCE", False)
         self.dry_run = env_bool("DRY_RUN", False)
         self.log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
@@ -188,6 +193,8 @@ class State:
         self.files = set()
         self.dirs = set()
         self.pending = {}  # unstable files being watched, see StabilityTracker
+        self.inodes = {}  # posix path -> (dev, ino) of each link we hold
+        self.known_inodes = {}  # (dev, ino) -> posix path, for spotting renames
 
     def load(self):
         try:
@@ -206,20 +213,30 @@ class State:
                 key: tuple(value) for key, value in pending.items()
                 if isinstance(value, list) and len(value) == 3
             }
+        inodes = data.get("inodes", {})
+        if isinstance(inodes, dict):
+            self.inodes = {
+                key: tuple(value) for key, value in inodes.items()
+                if isinstance(value, list) and len(value) == 2
+            }
+            self.known_inodes = {v: k for k, v in self.inodes.items()}
         log.debug(
             "loaded state: %d files, %d dirs, %d pending",
             len(self.files), len(self.dirs), len(self.pending),
         )
 
-    def save(self, files, dirs, pending=None):
+    def save(self, files, dirs, pending=None, inodes=None):
         self.files, self.dirs = set(files), set(dirs)
         self.pending = dict(pending or {})
+        self.inodes = dict(inodes or {})
+        self.known_inodes = {v: k for k, v in self.inodes.items()}
         payload = {
             "version": 1,
             "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "files": sorted(p.as_posix() for p in files),
             "dirs": sorted(p.as_posix() for p in dirs),
             "pending": {k: list(v) for k, v in sorted(self.pending.items())},
+            "inodes": {k: list(v) for k, v in sorted(self.inodes.items())},
         }
         tmp = self.path.with_name(self.path.name + ".tmp")
         try:
@@ -487,7 +504,23 @@ def replace_link(cfg, src, dst, stats):
         log.debug("relinked %s -> %s", dst, src)
 
 
-def sync_file(cfg, state, tracker, rel_path, src, dst, stats):
+def find_miscased(dst_names, wanted):
+    """The existing entry that differs from `wanted` only in capitalisation.
+
+    On a case-insensitive filesystem os.path.lexists() happily matches the old
+    spelling after a case-only rename, so the mirror would keep the stale name
+    forever unless we compare against the real directory entries.
+    """
+    if dst_names is None or wanted in dst_names:
+        return None
+    folded = wanted.lower()
+    for name in dst_names:
+        if name.lower() == folded:
+            return name
+    return None
+
+
+def sync_file(cfg, state, tracker, inodes, rel_path, src, dst, stats, dst_names=None):
     """Link src into dst. Returns True if the file was held back as unstable."""
     try:
         src_stat = os.stat(src)
@@ -496,26 +529,57 @@ def sync_file(cfg, state, tracker, rel_path, src, dst, stats):
         log.error("cannot stat %s: %s", src, exc)
         return False
 
+    key = rel_path.as_posix()
+    identity = (src_stat.st_dev, src_stat.st_ino)
     exists = os.path.lexists(dst)
+
+    miscased = find_miscased(dst_names, rel_path.name) if exists else None
+    if miscased is not None:
+        stale = dst.with_name(miscased)
+        stale_rel = rel_path.parent / miscased
+        if not is_ours(cfg, state, stale_rel, stale):
+            stats.errors += 1
+            log.warning("refusing to re-case %s: it is not one of our links", stale)
+            return False
+        if cfg.dry_run:
+            log.info("[dry-run] re-case %s -> %s", miscased, rel_path.name)
+            return False
+        try:
+            os.unlink(stale)
+        except OSError as exc:
+            stats.errors += 1
+            log.error("cannot remove miscased %s: %s", stale, exc)
+            return False
+        log.info("re-casing %s -> %s", miscased, rel_path.name)
+        exists = False  # fall through and create it under the right name
     if exists:
         # Already correctly linked: nothing to do, and nothing to watch.
         if cfg.link_mode == "hard":
             if same_hard_link(src_stat, dst):
                 stats.skipped += 1
                 tracker.settled(rel_path)
+                inodes[key] = identity
                 return False
         elif os.path.islink(dst):
             try:
                 if os.readlink(dst) == str(src):
                     stats.skipped += 1
                     tracker.settled(rel_path)
+                    inodes[key] = identity
                     return False
             except OSError:
                 pass
 
+    # A file we already mirror turning up under a new name is a rename, not new
+    # data: we only ever linked it once it was complete, so there is nothing to
+    # wait for. Without this a rename would drop out of the mirror until it had
+    # served the full settle period all over again.
+    renamed_from = state.known_inodes.get(identity) if cfg.link_mode == "hard" else None
+    if renamed_from is not None and renamed_from != key:
+        log.debug("%s is a rename of %s, linking without waiting", key, renamed_from)
     # From here we intend to write a link, so make sure the source has finished
     # arriving first. An existing link is left in place while we wait.
-    if not tracker.is_stable(rel_path, src_stat, time.time()):
+    elif not tracker.is_stable(rel_path, src_stat, time.time()):
         stats.deferred += 1
         message = "still changing, waiting for it to finish: %s (%d bytes)"
         if tracker.first_defer(rel_path):
@@ -527,6 +591,7 @@ def sync_file(cfg, state, tracker, rel_path, src, dst, stats):
     if not exists:
         make_link(cfg, src, dst, stats)
         tracker.settled(rel_path)
+        inodes[key] = identity
         return False
 
     if not is_ours(cfg, state, rel_path, dst):
@@ -535,12 +600,13 @@ def sync_file(cfg, state, tracker, rel_path, src, dst, stats):
         return False
     replace_link(cfg, src, dst, stats)
     tracker.settled(rel_path)
+    inodes[key] = identity
     return False
 
 
 def sync_tree(cfg, state, tracker, quarantined, stats):
-    """Mirror source into target; returns the (files, dirs) we now own."""
-    files, dirs = set(), set()
+    """Mirror source into target; returns the (files, dirs, inodes) we now own."""
+    files, dirs, inodes = set(), set(), {}
 
     for root, dirnames, filenames in os.walk(cfg.source, followlinks=False):
         root_path = Path(root)
@@ -561,6 +627,12 @@ def sync_tree(cfg, state, tracker, quarantined, stats):
                     dirnames[:] = []
                     continue
 
+        # Real entries in the mirrored directory, for exact-case comparison.
+        try:
+            dst_names = set(os.listdir(dst_root))
+        except OSError:
+            dst_names = None
+
         if rel_root != Path("."):
             dirs.add(rel_root)
 
@@ -576,14 +648,15 @@ def sync_tree(cfg, state, tracker, quarantined, stats):
                 log.debug("skipping symlink in source: %s", src)
                 continue
             deferred = sync_file(
-                cfg, state, tracker, rel_path, src, cfg.target / rel_path, stats
+                cfg, state, tracker, inodes, rel_path, src, cfg.target / rel_path,
+                stats, dst_names,
             )
             # A file we held back keeps its place only if we linked it before,
             # so an existing link survives the wait instead of being pruned.
             if not deferred or rel_path in state.files:
                 files.add(rel_path)
 
-    return files, dirs
+    return files, dirs, inodes
 
 
 def prune_tree(cfg, state, files, dirs, stats):
@@ -634,11 +707,50 @@ def prune_tree(cfg, state, files, dirs, stats):
             log.debug("pruned empty dir %s", root_path)
 
 
-def run_pass(cfg, state, tracker):
+def measure_target(cfg):
+    """Split what is in TARGET_DIR into space that is shared and space that is not.
+
+    A file with more than one name on disk (or a symlink we made) costs nothing
+    beyond the source. Anything else is a real standalone file - typically
+    something dropped into the target by hand - and does occupy disk.
+    """
+    shared_bytes = shared_files = alone_bytes = alone_files = 0
+    for root, _dirnames, filenames in os.walk(cfg.target, followlinks=False):
+        at_root = Path(root) == cfg.target
+        for name in filenames:
+            if at_root and (
+                name.startswith(STATE_FILENAME)
+                or (cfg.quarantine_file and name == cfg.quarantine_file)
+            ):
+                continue
+            path = os.path.join(root, name)
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if os.path.islink(path):
+                try:  # a symlink costs nothing; report the data it points at
+                    shared_bytes += os.stat(path).st_size
+                except OSError:
+                    pass
+                shared_files += 1
+            elif st.st_nlink > 1:
+                shared_bytes += st.st_size
+                shared_files += 1
+            else:
+                alone_bytes += st.st_size
+                alone_files += 1
+    return {
+        "shared_bytes": shared_bytes, "shared_files": shared_files,
+        "standalone_bytes": alone_bytes, "standalone_files": alone_files,
+    }
+
+
+def run_pass(cfg, state, tracker, status=None):
     stats = Stats()
     started = time.monotonic()
     quarantined = load_quarantine(cfg)
-    files, dirs = sync_tree(cfg, state, tracker, quarantined, stats)
+    files, dirs, inodes = sync_tree(cfg, state, tracker, quarantined, stats)
     tracker.sweep()
     if quarantined:
         remove_quarantined(cfg, state, quarantined, stats)
@@ -647,8 +759,23 @@ def run_pass(cfg, state, tracker):
     if cfg.dry_run:
         state.files, state.dirs = files, dirs
     else:
-        state.save(files, dirs, tracker.export())
-    log.info("scan complete in %.2fs: %s", time.monotonic() - started, stats)
+        state.save(files, dirs, tracker.export(), inodes)
+    elapsed = time.monotonic() - started
+    log.info("scan complete in %.2fs: %s", elapsed, stats)
+
+    if status is not None:
+        status.record_scan({
+            "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "seconds": round(elapsed, 2),
+            "linked": stats.linked, "relinked": stats.relinked,
+            "unchanged": stats.skipped, "pruned": stats.pruned,
+            "quarantined": stats.quarantined, "deferred": stats.deferred,
+            "errors": stats.errors,
+        })
+        try:
+            status.set_usage(measure_target(cfg))
+        except OSError as exc:
+            log.debug("could not measure target usage: %s", exc)
     return stats
 
 
@@ -675,6 +802,20 @@ def main():
         cfg.stable_seconds, cfg.dry_run,
     )
 
+    status = None
+    if cfg.web_enabled and not cfg.run_once:
+        status = webui.Status()
+        status.set_config({
+            "SOURCE_DIR": str(cfg.source), "TARGET_DIR": str(cfg.target),
+            "SCAN_INTERVAL": "%ds" % cfg.interval, "LINK_MODE": cfg.link_mode,
+            "STABLE_SECONDS": "%ds" % cfg.stable_seconds, "PRUNE": str(cfg.prune),
+            "INCLUDE_HIDDEN": str(cfg.include_hidden),
+            "EXCLUDE_PATTERNS": ", ".join(cfg.exclude),
+            "QUARANTINE_FILE": cfg.quarantine_file, "DRY_RUN": str(cfg.dry_run),
+        })
+        if webui.start(status, cfg.web_host, cfg.web_port) is None:
+            status = None
+
     stop = {"now": False}
 
     def handle_signal(signum, _frame):
@@ -688,10 +829,15 @@ def main():
             pass
 
     while True:
+        if status is not None:
+            status.set_state(running=True)
         try:
-            run_pass(cfg, state, tracker)
+            run_pass(cfg, state, tracker, status)
         except Exception:  # keep the daemon alive across unexpected failures
             log.exception("scan failed")
+        finally:
+            if status is not None:
+                status.set_state(running=False)
         if cfg.run_once or stop["now"]:
             break
         deadline = time.monotonic() + cfg.interval

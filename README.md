@@ -45,6 +45,8 @@ All settings come from the `.env` file (or plain environment variables).
 | `PRUNE` | `true` | Delete links whose source file is gone. |
 | `INCLUDE_HIDDEN` | `true` | Include dotfiles and dot-directories. |
 | `EXCLUDE_PATTERNS` | *(empty)* | Comma-separated globs to skip, e.g. `*.tmp,.git,@eaDir`. |
+| `WEB_ENABLED` | `true` | Serve the read-only status page. |
+| `WEB_PORT` | `2648` | Port for the status page. |
 | `STABLE_SECONDS` | `60` | Skip files still being written; link only after size and mtime hold steady this long. `0` disables. |
 | `QUARANTINE_FILE` | `assets.json` | Parent-utility manifest in `TARGET_DIR` listing assets to keep out of the mirror. Empty disables. |
 | `DRY_RUN` | `false` | Log actions without touching the filesystem. |
@@ -106,6 +108,32 @@ same filesystem (`device=171` on both sides) still refuse to link.
   mount.
 - **Symlinks in the source are skipped** to avoid duplicating link chains.
 
+## Status page
+
+With `WEB_ENABLED=true` (the default) the container serves a small read-only
+page at **http://localhost:2648/**, showing:
+
+- **Disk usage split in two** — how much of the target is shared with the source
+  and therefore costs nothing, versus how much is genuinely standalone. This is
+  the number Explorer gets wrong: it sums both and reports the total, because it
+  counts hard-linked blocks once per name.
+- **The active configuration**, as the running process resolved it — useful for
+  confirming the container sees the paths you think it does.
+- **A log of recent scans**, each with a timestamp, duration, and counts for
+  linked / relinked / unchanged / pruned / quarantined / deferred / errors.
+
+It refreshes every five seconds and is backed by `/api/status`, which returns
+the same data as JSON if you want to script against it.
+
+The page is served by the standard library in a daemon thread — no framework,
+no extra dependencies, and a slow request can never hold up a scan. It is
+read-only: nothing on it can change the configuration or touch a file. It also
+has **no authentication**, so only publish the port on a network you trust.
+Set `WEB_ENABLED=false` to turn it off, or change `WEB_PORT` to move it.
+
+The usage figures come from one `lstat` per target file after each scan, so
+they cost about the same as the pruning walk.
+
 ## Files that are still arriving
 
 A file is only linked once its **size and mtime have both held steady for
@@ -117,6 +145,15 @@ Size is compared as well as mtime because sync clients, Dropbox among them,
 preserve a file's *original* timestamp while its data is still arriving. An
 mtime age check alone would call a half-downloaded file finished; a size check
 catches it.
+
+**Renames are exempt.** A renamed file is recognised by its inode as content
+already mirrored — and we only ever link a file once it is complete — so it is
+re-linked under the new name in the *same* scan that prunes the old one. Without
+this a rename would drop out of the mirror and serve the whole settle period
+again, leaving the file missing from the target for a scan or two. The same
+applies to renamed directories, and to a rename that only changes
+capitalisation: on a case-insensitive filesystem the mirror is re-cased to match
+the source rather than keeping the old spelling.
 
 Two consequences worth knowing:
 

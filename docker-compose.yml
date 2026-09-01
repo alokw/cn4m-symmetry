@@ -5,6 +5,8 @@ services:
     container_name: cn4m-symmetry
     restart: unless-stopped
     env_file: .env
+    ports:
+      - "${WEB_PORT:-2648}:${WEB_PORT:-2648}"
     # Hard links cannot cross mount points, so mount ONE parent directory and
     # point SOURCE_DIR/TARGET_DIR at subfolders inside it. Two separate bind
     # mounts will fail with EXDEV even on the same disk.
