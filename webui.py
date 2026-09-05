@@ -28,12 +28,51 @@ def human_bytes(size):
 class Status:
     """Thread-safe snapshot of what the scanner is doing."""
 
-    def __init__(self, history=60):
+    # Problem states first, so a truncated list never hides the interesting rows.
+    ORDER = {"error": 0, "deleted": 1, "deferred": 2, "quarantined": 3,
+             "excluded": 4, "symlink": 5, "linked": 6, "relinked": 6, "unchanged": 7}
+
+    def __init__(self, history=60, allow_actions=True):
         self._lock = threading.Lock()
         self._config = {}
         self._usage = {}
         self._scans = deque(maxlen=history)
         self._state = {"running": False, "last_scan": None, "next_scan": None}
+        self._files = []
+        self._counts = {}
+        self._truncated = 0
+        self.allow_actions = allow_actions
+        self._restores = set()
+        self.wake = threading.Event()
+
+    def set_inventory(self, entries, cap):
+        """Store the per-file result of a scan, most interesting rows first."""
+        entries = entries or []
+        counts = {}
+        for entry in entries:
+            counts[entry["status"]] = counts.get(entry["status"], 0) + 1
+        ordered = sorted(entries, key=lambda e: (self.ORDER.get(e["status"], 9), e["path"]))
+        with self._lock:
+            self._counts = counts
+            self._truncated = max(0, len(ordered) - cap) if cap else 0
+            self._files = ordered[:cap] if cap else ordered
+
+    def request_restore(self, paths):
+        """Queue paths for a force push. Returns how many were accepted."""
+        if not self.allow_actions:
+            return 0
+        wanted = {str(p) for p in paths if str(p).strip()}
+        if not wanted:
+            return 0
+        with self._lock:
+            self._restores |= wanted
+        self.wake.set()
+        return len(wanted)
+
+    def take_restores(self):
+        with self._lock:
+            pending, self._restores = self._restores, set()
+        return pending
 
     def set_config(self, config):
         with self._lock:
@@ -68,6 +107,10 @@ class Status:
                 "usage": usage,
                 "state": dict(self._state),
                 "scans": list(self._scans),
+                "files": list(self._files),
+                "counts": dict(self._counts),
+                "truncated": self._truncated,
+                "allow_actions": self.allow_actions,
             }
 
 
@@ -123,7 +166,30 @@ PAGE = """<!doctype html>
   .hot { color:var(--accent); font-weight:600 }
   .bad { color:var(--err); font-weight:600 }
   .wait { color:var(--warn); font-weight:600 }
-  .scroll { overflow-x:auto }
+  .scroll { overflow-x:auto; max-height:460px; overflow-y:auto }
+  .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px }
+  input[type=search] { flex:1 1 220px; min-width:180px; padding:6px 10px; font:inherit;
+    font-size:13px; color:var(--ink); background:var(--bg); border:1px solid var(--line);
+    border-radius:7px }
+  input[type=search]:focus { outline:2px solid var(--accent); outline-offset:-1px }
+  .btn { font:inherit; font-size:12px; font-weight:600; padding:5px 11px; cursor:pointer;
+    color:#fff; background:var(--accent); border:0; border-radius:7px }
+  .btn:hover { filter:brightness(1.08) }
+  .btn:disabled { opacity:.55; cursor:default; filter:none }
+  .btn.small { padding:3px 9px; font-size:11.5px }
+  .chips { display:flex; gap:6px; flex-wrap:wrap }
+  .chip { font-size:11.5px; padding:2px 8px; border-radius:999px; border:1px solid var(--line);
+    color:var(--muted); background:var(--bg); cursor:pointer; user-select:none }
+  .chip.on { background:var(--accent); color:#fff; border-color:transparent }
+  .tag { font-size:11px; font-weight:600; padding:2px 7px; border-radius:5px;
+    background:var(--line); color:var(--muted); white-space:nowrap }
+  .tag.deleted { background:#b4231822; color:var(--err) }
+  .tag.deferred { background:#b4530922; color:var(--warn) }
+  .tag.quarantined { background:#7c3aed22; color:#7c3aed }
+  .tag.linked, .tag.unchanged, .tag.relinked { background:#3f8f6b22; color:var(--shared) }
+  .tag.error { background:#b4231822; color:var(--err) }
+  td.act { text-align:right; white-space:nowrap }
+  th.act { width:1% }
   footer { color:var(--muted); font-size:12px; text-align:center; margin-top:26px }
 </style>
 </head>
@@ -161,11 +227,26 @@ PAGE = """<!doctype html>
   </div>
 
   <div class="card">
+    <h2>Source files</h2>
+    <div class="toolbar">
+      <input id="filter" type="search" placeholder="Filter by path&hellip;" autocomplete="off">
+      <span id="chips" class="chips"></span>
+      <button id="pushAll" class="btn" hidden>Force push all deleted</button>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>Path</th><th class="num">Size</th><th>State</th>
+        <th class="act"></th></tr></thead>
+      <tbody id="files"></tbody>
+    </table></div>
+    <div class="note" id="filesNote"></div>
+  </div>
+
+  <div class="card">
     <h2>Recent scans</h2>
     <div class="scroll"><table>
       <thead><tr><th>Finished</th><th class="num">Linked</th><th class="num">Relinked</th>
         <th class="num">Unchanged</th><th class="num">Pruned</th><th class="num">Quarantined</th>
-        <th class="num">Deferred</th><th class="num">Errors</th><th class="num">Took</th></tr></thead>
+        <th class="num">Deferred</th><th class="num">Kept&nbsp;deleted</th><th class="num">Errors</th><th class="num">Took</th></tr></thead>
       <tbody id="scans"></tbody>
     </table></div>
     <div class="note" id="empty" hidden>No scans recorded yet.</div>
@@ -205,13 +286,90 @@ function render(d) {
     <td class="mono">${r.finished}</td>
     ${cell(r.linked)}${cell(r.relinked)}
     <td class="num zero">${r.unchanged}</td>
-    ${cell(r.pruned)}${cell(r.quarantined)}${cell(r.deferred, 'wait')}${cell(r.errors, 'bad')}
+    ${cell(r.pruned)}${cell(r.quarantined)}${cell(r.deferred, 'wait')}
+    ${cell(r.left_deleted)}${cell(r.errors, 'bad')}
     <td class="num zero">${r.seconds}s</td></tr>`).join('');
   $('empty').hidden = d.scans.length > 0;
 }
 
+let LAST = null, FILTER = '', ONLY = '';
+
+const esc = s => String(s).replace(/[&<>"]/g, c =>
+  ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+
+function size(n) {
+  const u = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let v = n || 0, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i ? v.toFixed(1) : v) + ' ' + u[i];
+}
+
+const LABEL = {
+  deleted: 'deleted in target', deferred: 'still arriving', quarantined: 'quarantined',
+  excluded: 'excluded', symlink: 'symlink, skipped', error: 'error',
+  linked: 'linked', relinked: 'relinked', unchanged: 'mirrored'
+};
+
+function renderFiles(d) {
+  const rows = d.files.filter(f =>
+    (!ONLY || f.status === ONLY) &&
+    (!FILTER || f.path.toLowerCase().includes(FILTER)));
+
+  $('chips').innerHTML = Object.entries(d.counts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => `<span class="chip ${ONLY === k ? 'on' : ''}" data-only="${k}">`
+      + `${esc(LABEL[k] || k)} ${n}</span>`).join('');
+
+  const canPush = d.allow_actions;
+  $('files').innerHTML = rows.map(f => {
+    const st = f.status === 'relinked' || f.status === 'linked' ? 'unchanged' : f.status;
+    const btn = (f.status === 'deleted' && canPush)
+      ? `<button class="btn small" data-push="${esc(f.path)}">Force push</button>` : '';
+    return `<tr><td class="mono">${esc(f.path)}</td><td class="num zero">${size(f.size)}</td>`
+      + `<td><span class="tag ${st}">${esc(LABEL[f.status] || f.status)}</span></td>`
+      + `<td class="act">${btn}</td></tr>`;
+  }).join('');
+
+  const deleted = d.counts.deleted || 0;
+  $('pushAll').hidden = !(deleted && canPush);
+  $('pushAll').textContent = `Force push all ${deleted} deleted`;
+  $('filesNote').textContent = d.files.length
+    ? `Showing ${rows.length} of ${d.files.length} files`
+      + (d.truncated ? ` (${d.truncated} more not listed)` : '')
+      + (canPush ? '' : ' \\u00b7 force push disabled by WEB_ALLOW_ACTIONS')
+    : 'No files seen yet.';
+}
+
+async function push(body, el) {
+  if (el) { el.disabled = true; el.textContent = 'queued\\u2026'; }
+  try {
+    await fetch('api/restore', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)
+    });
+    setTimeout(tick, 900);
+  } catch (e) { if (el) { el.disabled = false; el.textContent = 'Force push'; } }
+}
+
+document.addEventListener('click', e => {
+  const chip = e.target.closest('[data-only]');
+  if (chip) { ONLY = ONLY === chip.dataset.only ? '' : chip.dataset.only;
+              if (LAST) renderFiles(LAST); return; }
+  const one = e.target.closest('[data-push]');
+  if (one) { push({paths: [one.dataset.push]}, one); return; }
+  if (e.target.id === 'pushAll') push({all: true}, e.target);
+});
+
+$('filter').addEventListener('input', e => {
+  FILTER = e.target.value.trim().toLowerCase();
+  if (LAST) renderFiles(LAST);
+});
+
 async function tick() {
-  try { render(await (await fetch('api/status', {cache: 'no-store'})).json()); }
+  try {
+    const d = await (await fetch('api/status', {cache: 'no-store'})).json();
+    LAST = d; render(d); renderFiles(d);
+  }
   catch (e) { $('pill').textContent = 'unreachable'; $('pill').className = 'pill idle'; }
 }
 tick(); setInterval(tick, 5000);
@@ -236,6 +394,27 @@ def _make_handler(status):
                 self.wfile.write(payload)
             except (BrokenPipeError, ConnectionResetError):
                 pass  # browser navigated away mid-response
+
+        def do_POST(self):
+            if self.path.split("?", 1)[0].rstrip("/") != "/api/restore":
+                self._send(404, '{"error":"not found"}', "application/json")
+                return
+            if not status.allow_actions:
+                self._send(
+                    403, '{"error":"actions are disabled (WEB_ALLOW_ACTIONS=false)"}',
+                    "application/json",
+                )
+                return
+            try:
+                length = min(int(self.headers.get("Content-Length") or 0), 1 << 20)
+                body = json.loads(self.rfile.read(length) or "{}")
+                paths = ["*"] if body.get("all") else list(body.get("paths") or [])
+            except (ValueError, TypeError):
+                self._send(400, '{"error":"expected JSON"}', "application/json")
+                return
+            accepted = status.request_restore(paths)
+            log.info("status page requested a force push of %d path(s)", accepted)
+            self._send(200, json.dumps({"ok": True, "queued": accepted}), "application/json")
 
         def do_GET(self):
             path = self.path.split("?", 1)[0].rstrip("/") or "/"

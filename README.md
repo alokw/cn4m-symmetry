@@ -45,8 +45,12 @@ All settings come from the `.env` file (or plain environment variables).
 | `PRUNE` | `true` | Delete links whose source file is gone. |
 | `INCLUDE_HIDDEN` | `true` | Include dotfiles and dot-directories. |
 | `EXCLUDE_PATTERNS` | *(empty)* | Comma-separated globs to skip, e.g. `*.tmp,.git,@eaDir`. |
+| `RESPECT_DELETIONS` | `true` | Never re-create a file or folder you deleted from the target. |
+| `STATE_FILE` | *(empty)* | Where to keep the bookkeeping; empty means `TARGET_DIR/.symmetry-state.json`. |
 | `WEB_ENABLED` | `true` | Serve the read-only status page. |
-| `WEB_PORT` | `2648` | Port for the status page. |
+| `WEB_PORT` | `2647` | Port for the status page. |
+| `WEB_ALLOW_ACTIONS` | `true` | Allow the force-push button; `false` keeps the page read-only. |
+| `WEB_MAX_FILES` | `5000` | Most files listed on the status page. |
 | `STABLE_SECONDS` | `60` | Skip files still being written; link only after size and mtime hold steady this long. `0` disables. |
 | `QUARANTINE_FILE` | `assets.json` | Parent-utility manifest in `TARGET_DIR` listing assets to keep out of the mirror. Empty disables. |
 | `DRY_RUN` | `false` | Log actions without touching the filesystem. |
@@ -108,10 +112,35 @@ same filesystem (`device=171` on both sides) still refuse to link.
   mount.
 - **Symlinks in the source are skipped** to avoid duplicating link chains.
 
+## Deleting things from the target
+
+With `RESPECT_DELETIONS=true` (the default) the mirror is a **one-time push per
+file**, not a continuous re-sync. Delete a file or a whole folder from
+`TARGET_DIR` and it stays deleted: the path is recorded and no later scan will
+put it back. The source is never touched, so the original is always still there.
+
+This works because the state file already records every path we created. A
+missing target file is therefore not ambiguous — either we linked it before, in
+which case you removed it, or we never did, in which case it is simply new.
+
+- **Put something back by hand** and it is managed again from the next scan.
+  Recreating a deleted folder restores its contents too, rather than leaving an
+  empty folder with no way to refill it.
+- **A link that failed** is not mistaken for a deletion. Only paths we
+  successfully linked are eligible, so a failed link is retried next scan.
+- **To re-push everything**, delete `.symmetry-state.json` from the target.
+- **Wiping the whole target** is read as a reset rather than a mass deletion:
+  the scan logs a warning and re-links, instead of writing the mirror off
+  permanently.
+
+Deletions are counted as `left_deleted` in the scan summary and on the status
+page. Set `RESPECT_DELETIONS=false` to go back to re-pushing whatever is
+missing.
+
 ## Status page
 
 With `WEB_ENABLED=true` (the default) the container serves a small read-only
-page at **http://localhost:2648/**, showing:
+page at **http://localhost:2647/**, showing:
 
 - **Disk usage split in two** — how much of the target is shared with the source
   and therefore costs nothing, versus how much is genuinely standalone. This is
@@ -121,6 +150,24 @@ page at **http://localhost:2648/**, showing:
   confirming the container sees the paths you think it does.
 - **A log of recent scans**, each with a timestamp, duration, and counts for
   linked / relinked / unchanged / pruned / quarantined / deferred / errors.
+- **Every file in the source**, with what became of it: mirrored, still
+  arriving, quarantined, excluded, errored, or **deleted in target** for the
+  ones being deliberately left out. Filter by path, or click a state to show
+  only those.
+
+### Force push
+
+Files flagged *deleted in target* carry a **Force push** button, with a
+**Force push all deleted** alongside it. Pressing one forgets that deletion and
+wakes the scanner immediately, so the file is linked again within a second
+rather than at the next interval.
+
+This is the one thing on the page that changes anything, and its blast radius is
+deliberately tiny: it only removes entries from the remembered-deletions list. It
+cannot delete, overwrite, or reach outside `SOURCE_DIR`, and an unknown path is a
+no-op — so there is nothing for a malformed or hostile request to damage. Even
+so, it is an unauthenticated write, so set `WEB_ALLOW_ACTIONS=false` if the port
+is reachable by anyone you would not hand the button to.
 
 It refreshes every five seconds and is backed by `/api/status`, which returns
 the same data as JSON if you want to script against it.

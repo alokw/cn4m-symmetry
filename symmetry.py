@@ -64,9 +64,13 @@ class Config:
         self.exclude = env_list("EXCLUDE_PATTERNS")
         self.quarantine_file = os.getenv("QUARANTINE_FILE", "assets.json").strip()
         self.stable_seconds = max(0, env_int("STABLE_SECONDS", 60))
+        self.respect_deletions = env_bool("RESPECT_DELETIONS", True)
+        self.state_file = os.getenv("STATE_FILE", "").strip()
         self.web_enabled = env_bool("WEB_ENABLED", True)
         self.web_host = os.getenv("WEB_HOST", "0.0.0.0").strip()
-        self.web_port = env_int("WEB_PORT", 2648)
+        self.web_port = env_int("WEB_PORT", 2647)
+        self.web_allow_actions = env_bool("WEB_ALLOW_ACTIONS", True)
+        self.web_max_files = max(0, env_int("WEB_MAX_FILES", 5000))
         self.run_once = env_bool("RUN_ONCE", False)
         self.dry_run = env_bool("DRY_RUN", False)
         self.log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
@@ -195,6 +199,10 @@ class State:
         self.pending = {}  # unstable files being watched, see StabilityTracker
         self.inodes = {}  # posix path -> (dev, ino) of each link we hold
         self.known_inodes = {}  # (dev, ino) -> posix path, for spotting renames
+        # Paths we linked once and the user has since removed from the target.
+        # Remembering them is what stops the next scan putting them back.
+        self.deleted = set()
+        self.deleted_dirs = set()
 
     def load(self):
         try:
@@ -220,16 +228,21 @@ class State:
                 if isinstance(value, list) and len(value) == 2
             }
             self.known_inodes = {v: k for k, v in self.inodes.items()}
+        self.deleted = set(data.get("deleted", []) or [])
+        self.deleted_dirs = set(data.get("deleted_dirs", []) or [])
         log.debug(
-            "loaded state: %d files, %d dirs, %d pending",
+            "loaded state: %d files, %d dirs, %d pending, %d deleted",
             len(self.files), len(self.dirs), len(self.pending),
+            len(self.deleted) + len(self.deleted_dirs),
         )
 
-    def save(self, files, dirs, pending=None, inodes=None):
+    def save(self, files, dirs, pending=None, inodes=None, deleted=None, deleted_dirs=None):
         self.files, self.dirs = set(files), set(dirs)
         self.pending = dict(pending or {})
         self.inodes = dict(inodes or {})
         self.known_inodes = {v: k for k, v in self.inodes.items()}
+        self.deleted = set(deleted or ())
+        self.deleted_dirs = set(deleted_dirs or ())
         payload = {
             "version": 1,
             "updated": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -237,6 +250,8 @@ class State:
             "dirs": sorted(p.as_posix() for p in dirs),
             "pending": {k: list(v) for k, v in sorted(self.pending.items())},
             "inodes": {k: list(v) for k, v in sorted(self.inodes.items())},
+            "deleted": sorted(self.deleted),
+            "deleted_dirs": sorted(self.deleted_dirs),
         }
         tmp = self.path.with_name(self.path.name + ".tmp")
         try:
@@ -398,12 +413,13 @@ class StabilityTracker:
 
 class Stats:
     __slots__ = (
-        "linked", "relinked", "skipped", "pruned", "quarantined", "deferred", "errors",
+        "linked", "relinked", "skipped", "pruned", "quarantined", "deferred",
+        "left_deleted", "errors",
     )
 
     def __init__(self):
         self.linked = self.relinked = self.skipped = self.pruned = 0
-        self.quarantined = self.deferred = self.errors = 0
+        self.quarantined = self.deferred = self.left_deleted = self.errors = 0
 
     def __str__(self):
         text = (
@@ -414,6 +430,8 @@ class Stats:
             text += " quarantined=%d" % self.quarantined
         if self.deferred:
             text += " deferred=%d" % self.deferred
+        if self.left_deleted:
+            text += " left_deleted=%d" % self.left_deleted
         return text
 
 
@@ -451,10 +469,11 @@ def is_ours(cfg, state, rel_path, dst):
 
 
 def make_link(cfg, src, dst, stats):
+    """Create the link. Returns True only if one now exists."""
     if cfg.dry_run:
         log.info("[dry-run] link %s -> %s", dst, src)
         stats.linked += 1
-        return
+        return True
     try:
         if cfg.link_mode == "hard":
             os.link(src, dst)
@@ -462,6 +481,7 @@ def make_link(cfg, src, dst, stats):
             os.symlink(src, dst)
     except FileExistsError:
         stats.skipped += 1
+        return True  # something is already there; a race, not a failure
     except OSError as exc:
         stats.errors += 1
         if getattr(exc, "errno", None) == EXDEV:
@@ -472,17 +492,21 @@ def make_link(cfg, src, dst, stats):
             )
         else:
             log.error("failed to link %s -> %s: %s", dst, src, exc)
-    else:
-        stats.linked += 1
-        log.debug("linked %s -> %s", dst, src)
+        return False
+    stats.linked += 1
+    log.debug("linked %s -> %s", dst, src)
+    return True
 
 
 def replace_link(cfg, src, dst, stats):
-    """Atomically point dst at the current src (link then rename over)."""
+    """Atomically point dst at the current src (link then rename over).
+
+    Returns True only if the replacement actually landed.
+    """
     if cfg.dry_run:
         log.info("[dry-run] replace %s -> %s", dst, src)
         stats.relinked += 1
-        return
+        return True
     tmp = dst.with_name(dst.name + ".symmetry-tmp")
     try:
         if os.path.lexists(tmp):
@@ -499,9 +523,10 @@ def replace_link(cfg, src, dst, stats):
             os.unlink(tmp)
         except OSError:
             pass
-    else:
-        stats.relinked += 1
-        log.debug("relinked %s -> %s", dst, src)
+        return False
+    stats.relinked += 1
+    log.debug("relinked %s -> %s", dst, src)
+    return True
 
 
 def find_miscased(dst_names, wanted):
@@ -521,13 +546,13 @@ def find_miscased(dst_names, wanted):
 
 
 def sync_file(cfg, state, tracker, inodes, rel_path, src, dst, stats, dst_names=None):
-    """Link src into dst. Returns True if the file was held back as unstable."""
+    """Link src into dst. Returns what happened, as a short status string."""
     try:
         src_stat = os.stat(src)
     except OSError as exc:
         stats.errors += 1
         log.error("cannot stat %s: %s", src, exc)
-        return False
+        return "error"
 
     key = rel_path.as_posix()
     identity = (src_stat.st_dev, src_stat.st_ino)
@@ -540,16 +565,16 @@ def sync_file(cfg, state, tracker, inodes, rel_path, src, dst, stats, dst_names=
         if not is_ours(cfg, state, stale_rel, stale):
             stats.errors += 1
             log.warning("refusing to re-case %s: it is not one of our links", stale)
-            return False
+            return "error"
         if cfg.dry_run:
             log.info("[dry-run] re-case %s -> %s", miscased, rel_path.name)
-            return False
+            return "unchanged"
         try:
             os.unlink(stale)
         except OSError as exc:
             stats.errors += 1
             log.error("cannot remove miscased %s: %s", stale, exc)
-            return False
+            return "error"
         log.info("re-casing %s -> %s", miscased, rel_path.name)
         exists = False  # fall through and create it under the right name
     if exists:
@@ -559,14 +584,14 @@ def sync_file(cfg, state, tracker, inodes, rel_path, src, dst, stats, dst_names=
                 stats.skipped += 1
                 tracker.settled(rel_path)
                 inodes[key] = identity
-                return False
+                return "unchanged"
         elif os.path.islink(dst):
             try:
                 if os.readlink(dst) == str(src):
                     stats.skipped += 1
                     tracker.settled(rel_path)
                     inodes[key] = identity
-                    return False
+                    return "unchanged"
             except OSError:
                 pass
 
@@ -586,27 +611,46 @@ def sync_file(cfg, state, tracker, inodes, rel_path, src, dst, stats, dst_names=
             log.info(message, rel_path.as_posix(), src_stat.st_size)
         else:
             log.debug(message, rel_path.as_posix(), src_stat.st_size)
-        return True
+        return "deferred"
 
     if not exists:
-        make_link(cfg, src, dst, stats)
+        if not make_link(cfg, src, dst, stats):
+            return "error"
         tracker.settled(rel_path)
         inodes[key] = identity
-        return False
+        return "linked"
 
     if not is_ours(cfg, state, rel_path, dst):
         stats.errors += 1
         log.warning("refusing to replace %s: it is a pre-existing file, not one of our links", dst)
-        return False
-    replace_link(cfg, src, dst, stats)
+        return "error"
+    if not replace_link(cfg, src, dst, stats):
+        return "error"
     tracker.settled(rel_path)
     inodes[key] = identity
-    return False
+    return "relinked"
 
 
-def sync_tree(cfg, state, tracker, quarantined, stats):
-    """Mirror source into target; returns the (files, dirs, inodes) we now own."""
+def sync_tree(cfg, state, tracker, quarantined, stats, honor_deletions=False,
+              inventory=None):
+    """Mirror source into target; returns what we now own and what stays deleted.
+
+    `inventory`, when given, is filled with one entry per source file describing
+    what became of it - that is what the status page lists.
+    """
     files, dirs, inodes = set(), set(), {}
+    deleted, deleted_dirs = set(state.deleted), set(state.deleted_dirs)
+    tracked = {p.as_posix() for p in state.files}
+
+    def note(key, status, src=None, size=None):
+        if inventory is None:
+            return
+        if size is None:
+            try:
+                size = os.stat(src).st_size if src is not None else 0
+            except OSError:
+                size = 0
+        inventory.append({"path": key, "status": status, "size": size})
 
     for root, dirnames, filenames in os.walk(cfg.source, followlinks=False):
         root_path = Path(root)
@@ -615,6 +659,36 @@ def sync_tree(cfg, state, tracker, quarantined, stats):
         dirnames[:] = sorted(d for d in dirnames if not is_excluded(cfg, d, rel_root / d))
 
         dst_root = cfg.target / rel_root
+        root_key = rel_root.as_posix()
+
+        if dst_root.is_dir():
+            if root_key in deleted_dirs:
+                # Recreating the folder undoes the whole deletion, contents
+                # included - otherwise it would sit there permanently empty.
+                deleted_dirs.discard(root_key)
+                prefix = root_key + "/"
+                deleted.difference_update(
+                    {k for k in deleted if k.startswith(prefix)}
+                )
+                log.info("folder %s is back in the target, managing it again", root_key)
+        elif (
+            honor_deletions
+            and rel_root != Path(".")
+            and (root_key in deleted_dirs or rel_root in state.dirs)
+            and dst_root.parent.is_dir()
+        ):
+            # The folder was mirrored before and is gone now: the user removed
+            # it. Leave it out, and do not walk into it looking for its files.
+            if root_key not in deleted_dirs:
+                deleted_dirs.add(root_key)
+                deleted.update(k for k in tracked if k.startswith(root_key + "/"))
+                log.info("folder %s was deleted from the target, leaving it out", root_key)
+            stats.left_deleted += 1
+            for entry in sorted(filenames):
+                note((rel_root / entry).as_posix(), "deleted", root_path / entry)
+            dirnames[:] = []
+            continue
+
         if not dst_root.is_dir():
             if cfg.dry_run:
                 log.info("[dry-run] mkdir %s", dst_root)
@@ -639,24 +713,51 @@ def sync_tree(cfg, state, tracker, quarantined, stats):
         for name in sorted(filenames):
             rel_path = rel_root / name
             if is_excluded(cfg, name, rel_path):
+                note(rel_path.as_posix(), "excluded", root_path / name)
                 continue
             if is_quarantined(quarantined, rel_path):
                 log.debug("skipping quarantined asset: %s", rel_path.as_posix())
+                note(rel_path.as_posix(), "quarantined", root_path / name)
                 continue
             src = root_path / name
             if os.path.islink(src):
                 log.debug("skipping symlink in source: %s", src)
+                note(rel_path.as_posix(), "symlink", src)
                 continue
-            deferred = sync_file(
-                cfg, state, tracker, inodes, rel_path, src, cfg.target / rel_path,
-                stats, dst_names,
-            )
-            # A file we held back keeps its place only if we linked it before,
-            # so an existing link survives the wait instead of being pruned.
-            if not deferred or rel_path in state.files:
-                files.add(rel_path)
 
-    return files, dirs, inodes
+            key = rel_path.as_posix()
+            dst = cfg.target / rel_path
+            if honor_deletions:
+                present = os.path.lexists(dst)
+                if key in deleted:
+                    if not present:
+                        stats.left_deleted += 1
+                        note(key, "deleted", src)
+                        continue
+                    deleted.discard(key)  # put back by hand: manage it again
+                    log.info("%s is back in the target, managing it again", key)
+                elif key in tracked and not present:
+                    # We linked this once and it is gone: the user deleted it.
+                    deleted.add(key)
+                    stats.left_deleted += 1
+                    log.info("%s was deleted from the target, leaving it out", key)
+                    note(key, "deleted", src)
+                    continue
+
+            outcome = sync_file(
+                cfg, state, tracker, inodes, rel_path, src, dst, stats, dst_names,
+            )
+            note(key, outcome, src)
+            deferred = outcome == "deferred"
+            # Only claim a path once a link really exists for it. A link that
+            # failed stays unclaimed so the next scan retries it rather than
+            # mistaking the absence for a deletion.
+            if key in inodes:
+                files.add(rel_path)
+            elif deferred and rel_path in state.files:
+                files.add(rel_path)  # keep the older link from being pruned
+
+    return files, dirs, inodes, deleted, deleted_dirs
 
 
 def prune_tree(cfg, state, files, dirs, stats):
@@ -707,6 +808,38 @@ def prune_tree(cfg, state, files, dirs, stats):
             log.debug("pruned empty dir %s", root_path)
 
 
+def clear_tombstones(state, paths):
+    """Forget that these paths were deleted, so the next scan links them again.
+
+    Only ever removes entries from the two remembered-deletion sets; it never
+    touches the filesystem, so an unrecognised path is simply a no-op.
+    """
+    if "*" in paths:
+        cleared = len(state.deleted) + len(state.deleted_dirs)
+        state.deleted, state.deleted_dirs = set(), set()
+        return cleared
+    cleared = 0
+    for path in paths:
+        key = path.strip("/")
+        prefix = key + "/"
+        for bucket in (state.deleted, state.deleted_dirs):
+            for entry in [e for e in bucket if e == key or e.startswith(prefix)]:
+                bucket.discard(entry)
+                cleared += 1
+    return cleared
+
+
+def target_is_empty(cfg):
+    """True if TARGET_DIR holds nothing at all (or cannot be read)."""
+    try:
+        with os.scandir(cfg.target) as entries:
+            for _entry in entries:
+                return False
+    except OSError:
+        return True
+    return True
+
+
 def measure_target(cfg):
     """Split what is in TARGET_DIR into space that is shared and space that is not.
 
@@ -750,7 +883,27 @@ def run_pass(cfg, state, tracker, status=None):
     stats = Stats()
     started = time.monotonic()
     quarantined = load_quarantine(cfg)
-    files, dirs, inodes = sync_tree(cfg, state, tracker, quarantined, stats)
+    if status is not None:
+        requested = status.take_restores()
+        if requested:
+            cleared = clear_tombstones(state, requested)
+            log.info("force push requested: %d path(s) will be linked again", cleared)
+
+    honor_deletions = cfg.respect_deletions
+    if honor_deletions and state.files and target_is_empty(cfg):
+        # Everything gone at once is a wiped or unavailable target, not someone
+        # deleting files. Re-link instead of writing the whole mirror off.
+        log.warning(
+            "TARGET_DIR is empty but %d links were recorded - treating this as a "
+            "reset and re-linking, rather than honouring it as a deletion",
+            len(state.files),
+        )
+        honor_deletions = False
+
+    inventory = [] if status is not None else None
+    files, dirs, inodes, deleted, deleted_dirs = sync_tree(
+        cfg, state, tracker, quarantined, stats, honor_deletions, inventory
+    )
     tracker.sweep()
     if quarantined:
         remove_quarantined(cfg, state, quarantined, stats)
@@ -758,8 +911,9 @@ def run_pass(cfg, state, tracker, status=None):
         prune_tree(cfg, state, files, dirs, stats)
     if cfg.dry_run:
         state.files, state.dirs = files, dirs
+        state.deleted, state.deleted_dirs = deleted, deleted_dirs
     else:
-        state.save(files, dirs, tracker.export(), inodes)
+        state.save(files, dirs, tracker.export(), inodes, deleted, deleted_dirs)
     elapsed = time.monotonic() - started
     log.info("scan complete in %.2fs: %s", elapsed, stats)
 
@@ -770,8 +924,9 @@ def run_pass(cfg, state, tracker, status=None):
             "linked": stats.linked, "relinked": stats.relinked,
             "unchanged": stats.skipped, "pruned": stats.pruned,
             "quarantined": stats.quarantined, "deferred": stats.deferred,
-            "errors": stats.errors,
+            "left_deleted": stats.left_deleted, "errors": stats.errors,
         })
+        status.set_inventory(inventory, cfg.web_max_files)
         try:
             status.set_usage(measure_target(cfg))
         except OSError as exc:
@@ -792,7 +947,13 @@ def main():
 
     ensure_target(cfg)
 
-    state = State(cfg.target / STATE_FILENAME)
+    state_path = Path(cfg.state_file) if cfg.state_file else cfg.target / STATE_FILENAME
+    if cfg.state_file and not cfg.dry_run:
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SystemExit("cannot create STATE_FILE folder %s: %s" % (state_path.parent, exc))
+    state = State(state_path)
     state.load()
     tracker = StabilityTracker(cfg.stable_seconds, state.pending)
 
@@ -804,14 +965,17 @@ def main():
 
     status = None
     if cfg.web_enabled and not cfg.run_once:
-        status = webui.Status()
+        status = webui.Status(allow_actions=cfg.web_allow_actions)
         status.set_config({
             "SOURCE_DIR": str(cfg.source), "TARGET_DIR": str(cfg.target),
             "SCAN_INTERVAL": "%ds" % cfg.interval, "LINK_MODE": cfg.link_mode,
             "STABLE_SECONDS": "%ds" % cfg.stable_seconds, "PRUNE": str(cfg.prune),
             "INCLUDE_HIDDEN": str(cfg.include_hidden),
             "EXCLUDE_PATTERNS": ", ".join(cfg.exclude),
-            "QUARANTINE_FILE": cfg.quarantine_file, "DRY_RUN": str(cfg.dry_run),
+            "QUARANTINE_FILE": cfg.quarantine_file,
+            "RESPECT_DELETIONS": str(cfg.respect_deletions),
+            "SOURCE_FILE_LIST": "up to %d shown" % cfg.web_max_files,
+            "DRY_RUN": str(cfg.dry_run),
         })
         if webui.start(status, cfg.web_host, cfg.web_port) is None:
             status = None
@@ -845,7 +1009,14 @@ def main():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            time.sleep(min(1.0, remaining))
+            # Still woken in slices so a signal is handled promptly, but a
+            # force push from the status page starts the next scan at once.
+            if status is not None and status.wake.wait(min(1.0, remaining)):
+                status.wake.clear()
+                log.info("rescanning now at the request of the status page")
+                break
+            if status is None:
+                time.sleep(min(1.0, remaining))
         if stop["now"]:
             break
 
