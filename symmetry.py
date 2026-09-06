@@ -16,6 +16,7 @@ import sys
 import time
 from pathlib import Path
 
+import notify
 import webui
 
 try:
@@ -69,6 +70,10 @@ class Config:
         self.web_enabled = env_bool("WEB_ENABLED", True)
         self.web_host = os.getenv("WEB_HOST", "0.0.0.0").strip()
         self.web_port = env_int("WEB_PORT", 2647)
+        self.status_url = os.getenv("STATUS_URL", "http://localhost:2640/suite/status").strip()
+        self.status_app = os.getenv("STATUS_APP", "symmetry").strip() or "symmetry"
+        self.status_level = os.getenv("STATUS_LEVEL", "working").strip() or "working"
+        self.status_timeout = max(1, env_int("STATUS_TIMEOUT", 5))
         self.web_allow_actions = env_bool("WEB_ALLOW_ACTIONS", True)
         self.web_max_files = max(0, env_int("WEB_MAX_FILES", 5000))
         self.run_once = env_bool("RUN_ONCE", False)
@@ -76,6 +81,10 @@ class Config:
         self.log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
     def validate(self):
+        if self.status_url and not self.status_url.startswith(("http://", "https://")):
+            raise SystemExit(
+                "STATUS_URL must start with http:// or https://, got %r" % self.status_url
+            )
         if self.link_mode not in ("hard", "symlink"):
             raise SystemExit("LINK_MODE must be 'hard' or 'symlink', got %r" % self.link_mode)
         if not self.source.is_dir():
@@ -879,7 +888,7 @@ def measure_target(cfg):
     }
 
 
-def run_pass(cfg, state, tracker, status=None):
+def run_pass(cfg, state, tracker, status=None, pusher=None):
     stats = Stats()
     started = time.monotonic()
     quarantined = load_quarantine(cfg)
@@ -916,6 +925,10 @@ def run_pass(cfg, state, tracker, status=None):
         state.save(files, dirs, tracker.export(), inodes, deleted, deleted_dirs)
     elapsed = time.monotonic() - started
     log.info("scan complete in %.2fs: %s", elapsed, stats)
+
+    # Tell the parent utility whenever the mirror actually gained something.
+    if pusher is not None and stats.linked:
+        pusher.send(notify.link_message(stats))
 
     if status is not None:
         status.record_scan({
@@ -963,6 +976,12 @@ def main():
         cfg.stable_seconds, cfg.dry_run,
     )
 
+    pusher = notify.StatusPusher(
+        cfg.status_url, cfg.status_app, cfg.status_level, cfg.status_timeout
+    )
+    if pusher.enabled:
+        log.info("status updates go to %s as app=%s", cfg.status_url, cfg.status_app)
+
     status = None
     if cfg.web_enabled and not cfg.run_once:
         status = webui.Status(allow_actions=cfg.web_allow_actions)
@@ -975,6 +994,7 @@ def main():
             "QUARANTINE_FILE": cfg.quarantine_file,
             "RESPECT_DELETIONS": str(cfg.respect_deletions),
             "SOURCE_FILE_LIST": "up to %d shown" % cfg.web_max_files,
+            "STATUS_URL": cfg.status_url,
             "DRY_RUN": str(cfg.dry_run),
         })
         if webui.start(status, cfg.web_host, cfg.web_port) is None:
@@ -996,7 +1016,7 @@ def main():
         if status is not None:
             status.set_state(running=True)
         try:
-            run_pass(cfg, state, tracker, status)
+            run_pass(cfg, state, tracker, status, pusher)
         except Exception:  # keep the daemon alive across unexpected failures
             log.exception("scan failed")
         finally:
@@ -1020,6 +1040,7 @@ def main():
         if stop["now"]:
             break
 
+    pusher.drain()
     log.info("symmetry stopped")
     return 0
 

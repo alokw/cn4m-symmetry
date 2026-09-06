@@ -7,6 +7,10 @@ services:
     env_file: .env
     ports:
       - "${WEB_PORT:-2647}:${WEB_PORT:-2647}"
+    # Lets STATUS_URL reach cn4m on the Docker host as host.docker.internal.
+    # Docker Desktop provides this name already; this line adds it on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Hard links cannot cross mount points, so mount ONE parent directory and
     # point SOURCE_DIR/TARGET_DIR at subfolders inside it. Two separate bind
     # mounts will fail with EXDEV even on the same disk.

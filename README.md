@@ -7,14 +7,25 @@ additional disk space — every linked file is the same inode on disk.
 
 ## How it works
 
-Every `SCAN_INTERVAL` seconds it:
+Every `SCAN_INTERVAL` seconds it walks `SOURCE_DIR` and makes `TARGET_DIR` match
+it, using links rather than copies:
 
-1. Walks `SOURCE_DIR` recursively.
-2. Recreates each subdirectory under `TARGET_DIR` (real directories — only
-   files get linked).
-3. Hard links each file into the matching spot in `TARGET_DIR`.
-4. Skips anything already correctly linked (same inode), re-links files whose
-   source was replaced, and prunes links whose source is gone.
+1. Recreates each subdirectory as a real (empty) directory — only files are
+   linked.
+2. Hard links each file into the matching place, skipping anything already
+   correctly linked.
+3. Holds back files that are still being written, and re-links a file whose
+   source was replaced.
+4. Recognises a renamed file by its inode and moves the link with it, in the
+   same scan.
+5. Prunes links whose source is gone, leaves alone anything it did not create,
+   and never puts back something you deleted from the target.
+6. Keeps out assets cn4m has quarantined, reports what it did on a small status
+   page, and tells cn4m when the mirror gains files.
+
+The source directory is only ever read. Every write happens inside
+`TARGET_DIR`.
+
 
 ## Quick start
 
@@ -32,6 +43,7 @@ pip install -r requirements.txt
 python symmetry.py
 ```
 
+
 ## Configuration
 
 All settings come from the `.env` file (or plain environment variables).
@@ -47,6 +59,10 @@ All settings come from the `.env` file (or plain environment variables).
 | `EXCLUDE_PATTERNS` | *(empty)* | Comma-separated globs to skip, e.g. `*.tmp,.git,@eaDir`. |
 | `RESPECT_DELETIONS` | `true` | Never re-create a file or folder you deleted from the target. |
 | `STATE_FILE` | *(empty)* | Where to keep the bookkeeping; empty means `TARGET_DIR/.symmetry-state.json`. |
+| `STATUS_URL` | `http://localhost:2640/suite/status` | cn4m endpoint to notify when new links are made; empty disables. |
+| `STATUS_APP` | `symmetry` | `app` field sent with each update. |
+| `STATUS_LEVEL` | `working` | `level` field sent with each update. |
+| `STATUS_TIMEOUT` | `5` | Seconds to wait on the status endpoint. |
 | `WEB_ENABLED` | `true` | Serve the read-only status page. |
 | `WEB_PORT` | `2647` | Port for the status page. |
 | `WEB_ALLOW_ACTIONS` | `true` | Allow the force-push button; `false` keeps the page read-only. |
@@ -56,7 +72,10 @@ All settings come from the `.env` file (or plain environment variables).
 | `DRY_RUN` | `false` | Log actions without touching the filesystem. |
 | `RUN_ONCE` | `false` | Do one scan and exit. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
+| `WEB_HOST` | `0.0.0.0` | Interface the status page binds to; `127.0.0.1` keeps it local. |
+| `ENV_FILE` | *(next to the script)* | Path to the `.env` to read. |
 | `HOST_DATA_DIR` | `/mnt/pool` | Host path mounted at `/data` (compose only). |
+
 
 ## Mapping your folders
 
@@ -93,6 +112,7 @@ same filesystem (`device=171` on both sides) still refuse to link.
 | Folders on different disks | `LINK_MODE=symlink` — hard links cannot span filesystems. |
 | Not running in Docker | Same-filesystem rule still applies; mounts are not a concern. |
 
+
 ## Hard links: the rules that bite
 
 - **Same filesystem only.** A hard link is a second name for an existing inode,
@@ -111,6 +131,47 @@ same filesystem (`device=171` on both sides) still refuse to link.
   directories, which is what makes this a virtual mirror rather than a bind
   mount.
 - **Symlinks in the source are skipped** to avoid duplicating link chains.
+
+
+## Files that are still arriving
+
+A file is only linked once its **size and mtime have both held steady for
+`STABLE_SECONDS`**, compared across scans. Anything still growing — a download
+in progress, a large copy — is left alone and reported as `deferred` in the scan
+summary, then linked on the first scan after it settles.
+
+Size is compared as well as mtime because sync clients, Dropbox among them,
+preserve a file's *original* timestamp while its data is still arriving. An
+mtime age check alone would call a half-downloaded file finished; a size check
+catches it.
+
+**Renames are exempt.** A renamed file is recognised by its inode as content
+already mirrored — and we only ever link a file once it is complete — so it is
+re-linked under the new name in the *same* scan that prunes the old one. Without
+this a rename would drop out of the mirror and serve the whole settle period
+again, leaving the file missing from the target for a scan or two. The same
+applies to renamed directories, and to a rename that only changes
+capitalisation: on a case-insensitive filesystem the mirror is re-cased to match
+the source rather than keeping the old spelling.
+
+Two consequences worth knowing:
+
+- **A brand-new file waits one scan.** With nothing to compare against on first
+  sight, the earliest it can link is the following scan. Lower `SCAN_INTERVAL`
+  to shorten that, or set `STABLE_SECONDS=0` to link immediately.
+- **An existing link is kept while a replacement settles.** If a mirrored file
+  is replaced by one still being written, the old link stays in place (and is
+  not pruned) until the new version is stable, then gets swapped. The target
+  never contains a half-written file, and never briefly loses the good one.
+
+Observations are recorded in the state file, so waiting survives a restart and
+works in `RUN_ONCE` mode, where each scan is a separate process. Files that are
+already correctly linked are never re-examined, so a settled mirror does no
+extra work.
+
+If your writers use temporary names (`.part`, `.crdownload`, `.tmp`), adding
+them to `EXCLUDE_PATTERNS` skips them outright and complements this check.
+
 
 ## Deleting things from the target
 
@@ -136,6 +197,30 @@ which case you removed it, or we never did, in which case it is simply new.
 Deletions are counted as `left_deleted` in the scan summary and on the status
 page. Set `RESPECT_DELETIONS=false` to go back to re-pushing whatever is
 missing.
+
+
+## Quarantined assets
+
+If the parent utility (cn4m) drops an `assets.json` alongside the state file in
+`TARGET_DIR`, every asset it lists under `untracked_quar_assets` or
+`tracked_quar_assets` is treated as quarantined:
+
+- it is never linked into the mirror, and
+- if an earlier scan already linked it, that link is removed.
+
+Removal ignores `PRUNE` — a quarantined asset should not remain in the target
+either way — and only ever unlinks inside `TARGET_DIR`, so **the source file is
+never touched**. Clear an asset out of those buckets and the next scan links it
+back in.
+
+Entries are matched on the `parent` and `name` fields rather than the `folder`
+path, since `folder` is expressed in the parent utility's own namespace
+(`/cn4m_assets/repo/1100`). Matching the pair also keeps working if the mirrored
+tree is deeper than one level. A missing, malformed, or unreadable `assets.json`
+means "nothing quarantined": the file is skipped with a warning and mirroring
+carries on, rather than a broken manifest stalling the sync. `assets.json`
+itself is never pruned from the target.
+
 
 ## Status page
 
@@ -181,66 +266,54 @@ Set `WEB_ENABLED=false` to turn it off, or change `WEB_PORT` to move it.
 The usage figures come from one `lstat` per target file after each scan, so
 they cost about the same as the pruning walk.
 
-## Files that are still arriving
 
-A file is only linked once its **size and mtime have both held steady for
-`STABLE_SECONDS`**, compared across scans. Anything still growing — a download
-in progress, a large copy — is left alone and reported as `deferred` in the scan
-summary, then linked on the first scan after it settles.
+## Telling cn4m what happened
 
-Size is compared as well as mtime because sync clients, Dropbox among them,
-preserve a file's *original* timestamp while its data is still arriving. An
-mtime age check alone would call a half-downloaded file finished; a size check
-catches it.
+Set `STATUS_URL` and every scan that links something posts a one-line update:
 
-**Renames are exempt.** A renamed file is recognised by its inode as content
-already mirrored — and we only ever link a file once it is complete — so it is
-re-linked under the new name in the *same* scan that prunes the old one. Without
-this a rename would drop out of the mirror and serve the whole settle period
-again, leaving the file missing from the target for a scan or two. The same
-applies to renamed directories, and to a rename that only changes
-capitalisation: on a case-insensitive filesystem the mirror is re-cased to match
-the source rather than keeping the old spelling.
+```
+POST http://<cn4m-host>:2640/suite/status
+app=symmetry&message=Discovered+and+linked+5+new+files&level=working
+```
 
-Two consequences worth knowing:
+Only scans that actually gained links send anything — a quiet scan stays quiet,
+so the endpoint sees traffic when there is news rather than once a minute
+forever. If files were also re-linked, the message says so:
+`Discovered and linked 1 new file, refreshed 1`.
 
-- **A brand-new file waits one scan.** With nothing to compare against on first
-  sight, the earliest it can link is the following scan. Lower `SCAN_INTERVAL`
-  to shorten that, or set `STABLE_SECONDS=0` to link immediately.
-- **An existing link is kept while a replacement settles.** If a mirrored file
-  is replaced by one still being written, the old link stays in place (and is
-  not pruned) until the new version is stable, then gets swapped. The target
-  never contains a half-written file, and never briefly loses the good one.
+### localhost means the container
 
-Observations are recorded in the state file, so waiting survives a restart and
-works in `RUN_ONCE` mode, where each scan is a separate process. Files that are
-already correctly linked are never re-examined, so a settled mirror does no
-extra work.
+`STATUS_URL` defaults to `http://localhost:2640/suite/status`, which is right
+when symmetry runs directly on the same machine as cn4m. **Inside Docker,
+`localhost` is the container itself**, not the machine running Docker, so that
+default cannot reach a cn4m on the host. Use whichever applies:
 
-If your writers use temporary names (`.part`, `.crdownload`, `.tmp`), adding
-them to `EXCLUDE_PATTERNS` skips them outright and complements this check.
+| Where cn4m runs | `STATUS_URL` |
+| --- | --- |
+| On the Docker host | `http://host.docker.internal:2640/suite/status` |
+| As another container | `http://<its service name>:2640/suite/status` |
+| Same machine, no Docker | `http://localhost:2640/suite/status` |
 
-## Quarantined assets
+`docker-compose.yml` maps `host.docker.internal` to the host gateway, so the
+first form works on Linux as well as Docker Desktop. If a localhost URL fails
+from inside a container, the log says all this rather than just reporting a
+refused connection.
 
-If the parent utility (cn4m) drops an `assets.json` alongside the state file in
-`TARGET_DIR`, every asset it lists under `untracked_quar_assets` or
-`tracked_quar_assets` is treated as quarantined:
+### When cn4m is not there
 
-- it is never linked into the mirror, and
-- if an earlier scan already linked it, that link is removed.
+A failing endpoint is left alone rather than retried every scan: after a failure
+updates pause for 60 seconds, then 2, 4, 8 minutes and so on up to 30, and the
+first success resets it. So an unset, wrong, or temporarily down cn4m costs one
+attempt and a single log line, not a broken request every minute. An HTTP error
+such as a 404 backs off the same way a refused connection does.
 
-Removal ignores `PRUNE` — a quarantined asset should not remain in the target
-either way — and only ever unlinks inside `TARGET_DIR`, so **the source file is
-never touched**. Clear an asset out of those buckets and the next scan links it
-back in.
+Updates go out on a background thread and swallow their errors, so a cn4m that
+is slow, down, or not there at all cannot delay or interrupt mirroring. A
+failure is logged once at `WARNING`, then at `DEBUG` until it recovers. Setting
+`STATUS_URL` empty disables the whole thing. In-flight updates get a moment to
+finish on shutdown, which is what makes the update from a `RUN_ONCE` scan — and
+from the last scan before `docker stop` — actually arrive.
 
-Entries are matched on the `parent` and `name` fields rather than the `folder`
-path, since `folder` is expressed in the parent utility's own namespace
-(`/cn4m_assets/repo/1100`). Matching the pair also keeps working if the mirrored
-tree is deeper than one level. A missing, malformed, or unreadable `assets.json`
-means "nothing quarantined": the file is skipped with a warning and mirroring
-carries on, rather than a broken manifest stalling the sync. `assets.json`
-itself is never pruned from the target.
 
 ## Safety
 
@@ -259,6 +332,7 @@ It also refuses to start if `SOURCE_DIR` and `TARGET_DIR` are the same folder or
 nested inside one another. Use `DRY_RUN=true` for a first run to see exactly
 what it would do.
 
+
 ## Verified behaviour
 
 Tested in the container against a Linux filesystem: hard links share the source
@@ -270,3 +344,49 @@ touched, and `SIGTERM` from `docker stop` exits cleanly mid-interval.
 Running the script directly on Windows works for `LINK_MODE=hard` on NTFS;
 `LINK_MODE=symlink` needs Developer Mode or an elevated shell, which is a
 Windows privilege rule rather than a limitation of the tool.
+
+## Code map
+
+Three files, no framework, and `python-dotenv` is the only dependency — it is
+optional at that, with a no-op fallback if it is missing.
+
+| File | What lives there |
+| --- | --- |
+| `symmetry.py` | Config, state, and the scan itself. |
+| `webui.py` | The status page: snapshot object, HTML, and the server. |
+| `notify.py` | Pushing status lines to cn4m. |
+
+### Pieces worth lifting into another project
+
+Each of these is written to stand on its own — plain stdlib, no imports from the
+rest of the tool unless noted.
+
+| Where | What it does | To reuse |
+| --- | --- | --- |
+| `notify.py` (whole file) | Fire-and-forget HTTP status pushes with exponential backoff, a one-line-per-outage log, and a shutdown drain so the last update is not lost. | Copy the file. Only `link_message()` at the bottom knows about mirroring. |
+| `webui.py:28` `Status` | Lock-guarded snapshot a worker publishes and a web thread reads. | Copy; drop the fields you do not need. |
+| `webui.py:436` `start()` | Stdlib HTTP server on a daemon thread, JSON endpoint plus a polling page. | Copy with `_make_handler` above it. |
+| `symmetry.py:38-55` `env_bool` / `env_int` / `env_list` | Environment parsing that warns instead of crashing on bad input. | Copy the three functions. |
+| `symmetry.py:108` `load_config_file` | Resolves `.env` explicitly, avoiding `load_dotenv()`'s surprising script-relative search. | Copy. |
+| `symmetry.py:120` `warn_duplicate_keys` | Warns when a `.env` defines a key twice, since the last one silently wins. | Copy. |
+| `symmetry.py:196` `State` | JSON state file written atomically via temp-file rename, tolerating a corrupt or missing file. | Copy; replace the fields. |
+| `symmetry.py:363` `StabilityTracker` | Decides when a file has stopped being written, by size **and** mtime across polls rather than mtime age. | Copy; it only needs a stat and a timestamp. |
+| `symmetry.py:480-540` `make_link` / `replace_link` | Link creation, and replacement made atomic by linking to a temp name then renaming over. | Copy; both report success so a failure is never mistaken for done. |
+| `symmetry.py:852` `measure_target` | Splits a tree into bytes shared with another tree versus bytes genuinely its own, using link counts. | Copy; useful anywhere hard links make `du` lie. |
+| `symmetry.py:541` `find_miscased` | Spots an entry differing only in capitalisation, which `os.path.lexists()` cannot on a case-insensitive filesystem. | Copy. |
+
+### Ideas rather than code
+
+Three things here are more approach than snippet, and are the parts that took
+the most iteration to get right:
+
+- **Never trust mtime alone to mean "finished writing".** Sync clients preserve
+  a file's original timestamp while its data is still arriving, so a
+  half-downloaded file can look years old. Compare size too.
+- **A record of what you created is what makes cleanup safe.** A hard link is
+  indistinguishable from an ordinary file, so without a written record there is
+  no way to tell your own leftovers from someone else's data — and no way to
+  tell a deletion from something never created.
+- **Only claim an action once it has actually happened.** Recording an intent
+  before confirming the result is what turns one transient failure into
+  permanent state, which is why the link helpers return a success flag.

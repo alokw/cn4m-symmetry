@@ -15,6 +15,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY symmetry.py webui.py ./
+COPY symmetry.py webui.py notify.py ./
 
 ENTRYPOINT ["python", "-u", "/app/symmetry.py"]
