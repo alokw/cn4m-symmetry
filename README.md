@@ -318,15 +318,28 @@ from the last scan before `docker stop` — actually arrive.
 ## Safety
 
 The tool keeps a record of everything it created at
-`TARGET_DIR/.symmetry-state.json`, and `PRUNE` only deletes paths listed there
-(or paths that still carry a link's signature — a symlink, or a file with more
-than one name on disk). This matters because once a source file is deleted, the
-hard link left behind in the target is indistinguishable from an ordinary file;
-without the record there'd be no safe way to tell the leftovers apart from your
-own data. Anything unrecognised is left where it is.
+`TARGET_DIR/.symmetry-state.json` — each path, and the inode it linked there —
+and it will only ever delete or replace a file that **matches that record
+exactly**: the path it wrote down, still pointing at the inode it wrote down.
+Nothing is inferred from the filesystem. That rule is what makes the target
+safe to work in by hand:
 
-Delete the state file and the tool simply forgets it owned those links — it will
-re-link what's still in the source and leave the strays alone.
+- **Rename one of our links** and the new name is yours: it is not in the
+  record, so it is never pruned. The old name is treated as a deletion and not
+  pushed back (force push it from the status page if you want both).
+- **Make your own hard link** to one of our files, or **copy** a file in, and it
+  is left alone — even though a hard link is byte-for-byte indistinguishable
+  from one of ours.
+- **Replace one of our links with your own file** at the same path and the
+  inode no longer matches, so it is yours from then on.
+
+An earlier version guessed that any file with more than one name on disk was
+ours, which is exactly wrong for a link you made by renaming one of ours; it
+deleted such a file, and the guess is gone.
+
+Delete the state file and the tool forgets it owned anything: it re-links what
+is still in the source, reclaiming those as it goes, and leaves every stray
+where it is.
 
 It also refuses to start if `SOURCE_DIR` and `TARGET_DIR` are the same folder or
 nested inside one another. Use `DRY_RUN=true` for a first run to see exactly

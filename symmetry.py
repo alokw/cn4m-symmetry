@@ -381,11 +381,29 @@ class StabilityTracker:
         self.seen = dict(pending or {})
         self.logged = set()
         self._touched = set()
+        self._forced = set()  # paths to link on sight this scan, see force()
+
+    def force(self, paths):
+        """Skip the settle wait for these paths (or "*" for all) next scan.
+
+        Used for a force push from the status page: the user has asked for the
+        file explicitly, and it was a complete link before it was removed.
+        """
+        self._forced |= {p.strip("/") for p in paths}
+
+    def _is_forced(self, key):
+        if not self._forced:
+            return False
+        if "*" in self._forced or key in self._forced:
+            return True
+        return any(key.startswith(p + "/") for p in self._forced)
 
     def is_stable(self, rel_path, src_stat, now):
         if self.settle <= 0:
             return True
         key = rel_path.as_posix()
+        if self._is_forced(key):
+            return True
         self._touched.add(key)
         previous = self.seen.get(key)
         if previous is None or (previous[0], previous[1]) != (
@@ -415,6 +433,7 @@ class StabilityTracker:
             self.seen.pop(key, None)
             self.logged.discard(key)
         self._touched.clear()
+        self._forced.clear()  # a force push is good for one scan only
 
     def export(self):
         return self.seen
@@ -461,20 +480,26 @@ def same_hard_link(src_stat, dst_path):
 
 
 def is_ours(cfg, state, rel_path, dst):
-    """True if we may replace or delete dst.
+    """True only if dst is a link we made, at this path, and still that link.
 
-    Either we recorded creating it, or it still carries the signature of a link
-    we would have made (a symlink, or a file with more than one name on disk).
+    Ownership comes purely from the record: the path must be one we wrote down
+    and, where we know the inode we linked, the file there must still be it.
+    Guessing from the filesystem is not safe - a hard link the user made by
+    renaming or copying one of ours looks identical to one of ours, and an
+    earlier version of this check deleted exactly such a file.
     """
-    if rel_path in state.files:
+    if rel_path not in state.files:
+        return False
+    if cfg.link_mode != "hard":
         return True
+    recorded = state.inodes.get(rel_path.as_posix())
+    if recorded is None:
+        return True  # state predates inode tracking; the path record must do
     try:
         st = os.lstat(dst)
     except OSError:
         return False
-    if os.path.islink(dst):
-        return True
-    return cfg.link_mode == "hard" and st.st_nlink > 1
+    return (st.st_dev, st.st_ino) == tuple(recorded)
 
 
 def make_link(cfg, src, dst, stats):
@@ -896,6 +921,7 @@ def run_pass(cfg, state, tracker, status=None, pusher=None):
         requested = status.take_restores()
         if requested:
             cleared = clear_tombstones(state, requested)
+            tracker.force(requested)
             log.info("force push requested: %d path(s) will be linked again", cleared)
 
     honor_deletions = cfg.respect_deletions
