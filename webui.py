@@ -8,6 +8,7 @@ the scanner hands it after each pass - the server never touches the filesystem.
 import json
 import logging
 import threading
+import urllib.parse
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -32,7 +33,7 @@ class Status:
     ORDER = {"error": 0, "deleted": 1, "deferred": 2, "quarantined": 3,
              "excluded": 4, "symlink": 5, "linked": 6, "relinked": 6, "unchanged": 7}
 
-    def __init__(self, history=60, allow_actions=True):
+    def __init__(self, history=60, allow_actions=True, token=""):
         self._lock = threading.Lock()
         self._config = {}
         self._usage = {}
@@ -42,8 +43,51 @@ class Status:
         self._counts = {}
         self._truncated = 0
         self.allow_actions = allow_actions
+        self.token = token
         self._restores = set()
+        self._trusted = set()      # paths a webhook vouched for: link on sight
+        self._wake_reason = None
         self.wake = threading.Event()
+
+    def _wake_up(self, reason):
+        with self._lock:
+            self._wake_reason = self._wake_reason or reason
+        self.wake.set()
+
+    def take_wake_reason(self):
+        with self._lock:
+            reason, self._wake_reason = self._wake_reason, None
+        return reason or "webhook"
+
+    def request_rescan(self, paths=(), trust_all=False):
+        """Ask for a scan now. Paths given here skip the settle wait.
+
+        Coalesces naturally: any number of requests before the scanner wakes
+        produce one scan, and a request during a scan produces one more.
+        """
+        wanted = {str(p).strip("/") for p in paths if str(p).strip()}
+        if trust_all:
+            wanted.add("*")
+        with self._lock:
+            self._trusted |= wanted
+        self._wake_up("webhook")
+        return len(wanted)
+
+    def take_trusted(self):
+        with self._lock:
+            trusted, self._trusted = self._trusted, set()
+        return trusted
+
+    def authorised(self, headers, query):
+        """True if no token is configured, or the request carries it."""
+        if not self.token:
+            return True
+        supplied = (
+            headers.get("X-Webhook-Token")
+            or headers.get("Authorization", "").removeprefix("Bearer ").strip()
+            or (query.get("token") or [""])[0]
+        )
+        return supplied == self.token
 
     def set_inventory(self, entries, cap):
         """Store the per-file result of a scan, most interesting rows first."""
@@ -66,7 +110,7 @@ class Status:
             return 0
         with self._lock:
             self._restores |= wanted
-        self.wake.set()
+        self._wake_up("force push")
         return len(wanted)
 
     def take_restores(self):
@@ -244,7 +288,7 @@ PAGE = """<!doctype html>
   <div class="card">
     <h2>Recent scans</h2>
     <div class="scroll"><table>
-      <thead><tr><th>Finished</th><th class="num">Linked</th><th class="num">Relinked</th>
+      <thead><tr><th>Finished</th><th>Trigger</th><th class="num">Linked</th><th class="num">Relinked</th>
         <th class="num">Unchanged</th><th class="num">Pruned</th><th class="num">Quarantined</th>
         <th class="num">Deferred</th><th class="num">Kept&nbsp;deleted</th><th class="num">Errors</th><th class="num">Took</th></tr></thead>
       <tbody id="scans"></tbody>
@@ -284,6 +328,7 @@ function render(d) {
 
   $('scans').innerHTML = d.scans.map(r => `<tr>
     <td class="mono">${r.finished}</td>
+    <td class="${r.trigger === 'interval' ? 'zero' : 'hot'}">${r.trigger || ''}</td>
     ${cell(r.linked)}${cell(r.relinked)}
     <td class="num zero">${r.unchanged}</td>
     ${cell(r.pruned)}${cell(r.quarantined)}${cell(r.deferred, 'wait')}
@@ -395,9 +440,51 @@ def _make_handler(status):
             except (BrokenPipeError, ConnectionResetError):
                 pass  # browser navigated away mid-response
 
+        def _params(self):
+            """Merge query string with a JSON or form body into one dict."""
+            url = urllib.parse.urlparse(self.path)
+            params = {k: v for k, v in urllib.parse.parse_qs(url.query).items()}
+            length = min(int(self.headers.get("Content-Length") or 0), 1 << 20)
+            body = self.rfile.read(length) if length else b""
+            if body:
+                ctype = self.headers.get("Content-Type", "")
+                if "json" in ctype:
+                    data = json.loads(body)
+                    if not isinstance(data, dict):
+                        raise ValueError("expected a JSON object")
+                    for k, v in data.items():
+                        params[k] = v if isinstance(v, list) else [v]
+                else:
+                    for k, v in urllib.parse.parse_qs(body.decode("utf-8")).items():
+                        params[k] = v
+            return url.path.rstrip("/") or "/", params
+
+        def _rescan(self, params):
+            paths = [str(p) for p in params.get("path", []) + params.get("paths", [])]
+            trust_all = str((params.get("trust_all") or [""])[0]).lower() in ("1", "true", "yes")
+            vouched = status.request_rescan(paths, trust_all)
+            log.info(
+                "webhook: rescan requested%s",
+                " (%d path%s vouched for)" % (vouched, "" if vouched == 1 else "s")
+                if vouched else "",
+            )
+            self._send(200, json.dumps({"ok": True, "queued": True, "trusted": vouched}),
+                       "application/json")
+
         def do_POST(self):
-            if self.path.split("?", 1)[0].rstrip("/") != "/api/restore":
+            try:
+                path, params = self._params()
+            except (ValueError, TypeError, UnicodeDecodeError):
+                self._send(400, '{"error":"expected JSON or form data"}', "application/json")
+                return
+            if path not in ("/api/restore", "/api/rescan"):
                 self._send(404, '{"error":"not found"}', "application/json")
+                return
+            if not status.authorised(self.headers, params):
+                self._send(401, '{"error":"missing or wrong token"}', "application/json")
+                return
+            if path == "/api/rescan":
+                self._rescan(params)
                 return
             if not status.allow_actions:
                 self._send(
@@ -405,19 +492,21 @@ def _make_handler(status):
                     "application/json",
                 )
                 return
-            try:
-                length = min(int(self.headers.get("Content-Length") or 0), 1 << 20)
-                body = json.loads(self.rfile.read(length) or "{}")
-                paths = ["*"] if body.get("all") else list(body.get("paths") or [])
-            except (ValueError, TypeError):
-                self._send(400, '{"error":"expected JSON"}', "application/json")
-                return
+            all_flag = str((params.get("all") or [""])[0]).lower() in ("1", "true", "yes")
+            paths = ["*"] if all_flag else [str(p) for p in params.get("paths", [])]
             accepted = status.request_restore(paths)
             log.info("status page requested a force push of %d path(s)", accepted)
             self._send(200, json.dumps({"ok": True, "queued": accepted}), "application/json")
 
         def do_GET(self):
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path == "/api/rescan":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                if not status.authorised(self.headers, query):
+                    self._send(401, '{"error":"missing or wrong token"}', "application/json")
+                    return
+                self._rescan(query)
+                return
             if path == "/":
                 self._send(200, PAGE, "text/html; charset=utf-8")
             elif path == "/api/status":

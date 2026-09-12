@@ -67,6 +67,8 @@ All settings come from the `.env` file (or plain environment variables).
 | `WEB_PORT` | `2647` | Port for the status page. |
 | `WEB_ALLOW_ACTIONS` | `true` | Allow the force-push button; `false` keeps the page read-only. |
 | `WEB_MAX_FILES` | `5000` | Most files listed on the status page. |
+| `WEBHOOK_TOKEN` | *(empty)* | If set, `/api/rescan` and `/api/restore` require it. Empty means open. |
+| `WEBHOOK_DEBOUNCE` | `1` | Seconds to gather a burst of webhook calls into one scan. |
 | `STABLE_SECONDS` | `60` | Skip files still being written; link only after size and mtime hold steady this long. `0` disables. |
 | `QUARANTINE_FILE` | `assets.json` | Parent-utility manifest in `TARGET_DIR` listing assets to keep out of the mirror. Empty disables. |
 | `DRY_RUN` | `false` | Log actions without touching the filesystem. |
@@ -266,6 +268,45 @@ Set `WEB_ENABLED=false` to turn it off, or change `WEB_PORT` to move it.
 The usage figures come from one `lstat` per target file after each scan, so
 they cost about the same as the pruning walk.
 
+
+## Webhook: scan now
+
+`/api/rescan` starts a scan immediately instead of waiting for the next
+interval. It is meant for a file watcher to call the moment it knows a file has
+finished arriving:
+
+```sh
+curl -X POST http://localhost:2647/api/rescan -d path=1100/new_asset.mov
+```
+
+**Pass the path and it links on sight.** This is the important part: a file the
+watcher just reported is, by definition, on its first sight to the scanner, so
+the normal `STABLE_SECONDS` check would hold it for a full settle window and the
+"immediate" scan would link nothing. Naming the path tells the scanner the
+watcher has already confirmed the file is complete, so it skips that wait for
+those paths only. Everything else in the same scan is treated as usual.
+
+| Call | Effect |
+| --- | --- |
+| `-d path=a.mov -d path=b.mov` | Scan now; `a.mov` and `b.mov` link on sight. |
+| `-d path=1100` | Scan now; everything under `1100/` links on sight. |
+| no body | Scan now; new files still wait out `STABLE_SECONDS`. |
+| `-d trust_all=1` | Scan now; every file links on sight, this scan only. |
+
+Accepts JSON (`{"paths": [...]}`), form data, or a query string, over POST or
+GET — whichever the sender can manage. Relative to `SOURCE_DIR`, forward
+slashes.
+
+Calls **coalesce**: `WEBHOOK_DEBOUNCE` (1s) gathers a burst of callbacks into a
+single scan with all their paths vouched for, and a call that arrives mid-scan
+queues exactly one more. A rescan never undoes a deletion you made in the
+target — that is what force push is for.
+
+Set `WEBHOOK_TOKEN` and callers must present it as an `X-Webhook-Token` header,
+`Authorization: Bearer`, or `?token=`; the force-push endpoint is then guarded
+by the same token. The status page itself stays open. Each scan on the status
+page shows what triggered it — `interval`, `webhook`, `force push`, or
+`startup` — so you can confirm the watcher is getting through.
 
 ## Telling cn4m what happened
 

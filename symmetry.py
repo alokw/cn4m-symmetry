@@ -75,6 +75,8 @@ class Config:
         self.status_level = os.getenv("STATUS_LEVEL", "working").strip() or "working"
         self.status_timeout = max(1, env_int("STATUS_TIMEOUT", 5))
         self.web_allow_actions = env_bool("WEB_ALLOW_ACTIONS", True)
+        self.webhook_token = os.getenv("WEBHOOK_TOKEN", "").strip()
+        self.webhook_debounce = max(0.0, env_int("WEBHOOK_DEBOUNCE", 1))
         self.web_max_files = max(0, env_int("WEB_MAX_FILES", 5000))
         self.run_once = env_bool("RUN_ONCE", False)
         self.dry_run = env_bool("DRY_RUN", False)
@@ -913,7 +915,7 @@ def measure_target(cfg):
     }
 
 
-def run_pass(cfg, state, tracker, status=None, pusher=None):
+def run_pass(cfg, state, tracker, status=None, pusher=None, trigger="interval"):
     stats = Stats()
     started = time.monotonic()
     quarantined = load_quarantine(cfg)
@@ -923,6 +925,10 @@ def run_pass(cfg, state, tracker, status=None, pusher=None):
             cleared = clear_tombstones(state, requested)
             tracker.force(requested)
             log.info("force push requested: %d path(s) will be linked again", cleared)
+        trusted = status.take_trusted()
+        if trusted:
+            # A file watcher has told us these are complete: link on sight.
+            tracker.force(trusted)
 
     honor_deletions = cfg.respect_deletions
     if honor_deletions and state.files and target_is_empty(cfg):
@@ -959,6 +965,7 @@ def run_pass(cfg, state, tracker, status=None, pusher=None):
     if status is not None:
         status.record_scan({
             "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "trigger": trigger,
             "seconds": round(elapsed, 2),
             "linked": stats.linked, "relinked": stats.relinked,
             "unchanged": stats.skipped, "pruned": stats.pruned,
@@ -1010,7 +1017,7 @@ def main():
 
     status = None
     if cfg.web_enabled and not cfg.run_once:
-        status = webui.Status(allow_actions=cfg.web_allow_actions)
+        status = webui.Status(allow_actions=cfg.web_allow_actions, token=cfg.webhook_token)
         status.set_config({
             "SOURCE_DIR": str(cfg.source), "TARGET_DIR": str(cfg.target),
             "SCAN_INTERVAL": "%ds" % cfg.interval, "LINK_MODE": cfg.link_mode,
@@ -1021,6 +1028,8 @@ def main():
             "RESPECT_DELETIONS": str(cfg.respect_deletions),
             "SOURCE_FILE_LIST": "up to %d shown" % cfg.web_max_files,
             "STATUS_URL": cfg.status_url,
+            "WEBHOOK": "POST /api/rescan, %ss debounce%s" % (
+                cfg.webhook_debounce, ", token required" if cfg.webhook_token else ", open"),
             "DRY_RUN": str(cfg.dry_run),
         })
         if webui.start(status, cfg.web_host, cfg.web_port) is None:
@@ -1038,11 +1047,12 @@ def main():
         except (ValueError, AttributeError, OSError):
             pass
 
+    trigger = "startup"
     while True:
         if status is not None:
             status.set_state(running=True)
         try:
-            run_pass(cfg, state, tracker, status, pusher)
+            run_pass(cfg, state, tracker, status, pusher, trigger)
         except Exception:  # keep the daemon alive across unexpected failures
             log.exception("scan failed")
         finally:
@@ -1051,6 +1061,7 @@ def main():
         if cfg.run_once or stop["now"]:
             break
         deadline = time.monotonic() + cfg.interval
+        trigger = "interval"  # unless something wakes us early
         while not stop["now"]:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1059,7 +1070,13 @@ def main():
             # force push from the status page starts the next scan at once.
             if status is not None and status.wake.wait(min(1.0, remaining)):
                 status.wake.clear()
-                log.info("rescanning now at the request of the status page")
+                trigger = status.take_wake_reason()
+                # A file watcher tends to fire in bursts: give the rest of the
+                # burst a moment to land, so it becomes one scan, not fifty.
+                if cfg.webhook_debounce and not stop["now"]:
+                    time.sleep(cfg.webhook_debounce)
+                    status.wake.clear()
+                log.info("rescanning now: %s", trigger)
                 break
             if status is None:
                 time.sleep(min(1.0, remaining))
